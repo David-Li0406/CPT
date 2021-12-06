@@ -4,8 +4,7 @@ import logging
 import os
 import random
 import sys
-import nltk
-
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -20,14 +19,73 @@ from utils import DataTrainingArguments, ModelArguments, load_json
 import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from modeling_cpt import CPTModel, CPTForConditionalGeneration
+from transformers.models.bart import BartModel, BartForConditionalGeneration, BartTokenizer
 
+
+class GenDataset(torch.utils.data.Dataset):
+    def __init__(self, args, file, tokenizer: BartTokenizer):
+        self.tokenizer = tokenizer
+        self.seq_length = args.max_source_length
+
+        self.pad_id = tokenizer.encode('[PAD]')[1]
+        self.sep_id = tokenizer.encode('[PAD]')[1]
+        self.bos_id = tokenizer.encode('[CLS]')[1]
+        self.eos_id = tokenizer.encode('[SEP]')[1]
+
+        self.input_ids, self.attention_mask, self.labels = self.process(file)
+        assert len(self.input_ids) == len(self.attention_mask)
+
+    def process(self, file):
+        '''
+        data:{
+            'data':[
+                {
+                    'content':[,],
+                    'class':,
+                    'scenario:,'
+                }
+            ]
+        }
+        '''
+        input_ids = []
+        attention_mask = []
+        labels  = []
+        for item in tqdm(file['data']):
+            for position, dialog in enumerate(item['content']):
+                if position == 0:
+                    continue
+                assert len(dialog)< self.seq_length
+                with tokenizer.as_target_tokenizer():
+                    token_ids_target = self.tokenizer.encode(dialog)
+                labels.append(token_ids_target)
+                _position = position
+                cur_length = 0
+                token_ids_input = []
+                while _position > 0 and cur_length + len(self.tokenizer.encode(item['content'][_position-1])) + 3 < self.seq_length: 
+                    token_ids_input = self.tokenizer.encode(item['content'][_position-1])[1:-1] + [self.sep_id] + token_ids_input
+                    cur_length = len(token_ids_input)
+                    _position -= 1
+                input_ids.append([self.bos_id] + token_ids_input[:-1] + [self.eos_id] + [self.pad_id] * (self.seq_length - len(token_ids_input)))
+                attention_mask.append([1 for _ in range(len(token_ids_input)+1)]+[0 for _ in range(self.seq_length - len(token_ids_input))])
+                assert len(input_ids[-1]) == len(attention_mask[-1])
+        return input_ids, attention_mask, labels
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids":self.input_ids[idx], 
+            "attention_mask": self.attention_mask[idx], 
+            "labels":self.labels[idx]
+        }
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_path",default='/path/to/model',type=str)
 parser.add_argument("--dataset", default="lcsts",type=str)
 parser.add_argument("--lr",default=2e-5,type=float)
 parser.add_argument("--batch_size",default='50',type=str)
-parser.add_argument("--epoch",default='5',type=str)
+parser.add_argument("--epoch",default='50',type=str)
 parser.add_argument("--data_dir",default="/path/to/dataset/",type=str)
 args = parser.parse_args()
 arg_dict=args.__dict__
@@ -44,21 +102,21 @@ if not os.path.exists(outdir):
     os.mkdir(outdir)
 
 seed=len(os.listdir(outdir))+1
-outdir=outdir+'/'+str(seed)
-length_map={'lcsts':'30','csl':'50','adgen':'128'}
+outdir=outdir+'/'+str(args.epoch)+'/'+str(seed)
+length_map={'lcsts':'30','csl':'50','adgen':'128','cconv':'128'}
 
 
 args=[
     '--model_name_or_path',arg_dict['model_path'],
     '--do_train','--do_eval','--do_predict',
-    '--train_file',os.path.join(arg_dict['data_dir'],'SUMMARY.'+dataset_name,'train.json'),
-    '--validation_file',os.path.join(arg_dict['data_dir'],'SUMMARY.'+dataset_name,'dev.json'),
-    '--test_file',os.path.join(arg_dict['data_dir'],'SUMMARY.'+dataset_name,'test.json'),
+    '--train_file',os.path.join(arg_dict['data_dir'],'train.json'),
+    '--validation_file',os.path.join(arg_dict['data_dir'],'valid.json'),
+    '--test_file',os.path.join(arg_dict['data_dir'],'test.json'),
     '--output_dir',outdir,
     '--per_device_train_batch_size',arg_dict['batch_size'],
     '--per_device_eval_batch_size',arg_dict['batch_size'],
     '--overwrite_output_dir',
-    '--max_source_length=512',
+    '--max_source_length=128',
     '--val_max_target_length='+length_map[arg_dict['dataset']],
     '--predict_with_generate=1',
     '--seed',str(1000*seed),
@@ -88,7 +146,8 @@ if data_args.test_file is not None:
     data_files["test"] = data_args.test_file
 for key in data_files:
     print(key)
-    datasets[key]=load_json(data_files[key])
+    print(data_files[key])
+    datasets[key]=json.load(open(data_files[key],'r',encoding='utf8'))
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -108,73 +167,78 @@ if is_main_process(training_args.local_rank):
 logger.info("Training/evaluation parameters %s", training_args)
 
 tokenizer=BertTokenizer.from_pretrained(model_args.model_name_or_path)
-model=CPTForConditionalGeneration.from_pretrained(model_args.model_name_or_path)
+# model=CPTForConditionalGeneration.from_pretrained(model_args.model_name_or_path)
+model = BartForConditionalGeneration.from_pretrained(model_args.model_name_or_path)
 model.config.max_length=data_args.val_max_target_length
 
-text_column='article'
-summary_column='summarization'
-column_names = datasets["train"].column_names
-max_target_length = data_args.val_max_target_length
-padding=False
+# text_column='article'
+# summary_column='summarization'
+# column_names = datasets["train"].column_names
+# max_target_length = data_args.val_max_target_length
+# padding=False
 
-def preprocess_function(examples):
-    inputs = examples[text_column]
-    targets = examples[summary_column]
-    model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
+# def preprocess_function(examples):
+#     inputs = examples[text_column]
+#     targets = examples[summary_column]
+#     model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
 
-    # Setup the tokenizer for targets
-    with tokenizer.as_target_tokenizer():
-        labels = tokenizer(targets, max_length=max_target_length, padding=padding, truncation=True)
+#     # Setup the tokenizer for targets
+#     with tokenizer.as_target_tokenizer():
+#         labels = tokenizer(targets, max_length=max_target_length, padding=padding, truncation=True)
 
 
-    model_inputs["labels"] = labels["input_ids"]
-    return model_inputs
+#     model_inputs["labels"] = labels["input_ids"]
+#     return model_inputs
 
 
 
 if training_args.do_train:
-    train_dataset = datasets["train"]
-    if "train" not in datasets:
-        raise ValueError("--do_train requires a train dataset")
-    if data_args.max_train_samples is not None:
-        train_dataset = train_dataset.select(range(data_args.max_train_samples))
-    train_dataset = train_dataset.map(
-        preprocess_function,
-        batched=True,
-        num_proc=data_args.preprocessing_num_workers,
-        remove_columns=column_names,
-        load_from_cache_file=not data_args.overwrite_cache,
-    )
+    # train_dataset = datasets["train"]
+    # if "train" not in datasets:
+    #     raise ValueError("--do_train requires a train dataset")
+    # if data_args.max_train_samples is not None:
+    #     train_dataset = train_dataset.select(range(data_args.max_train_samples))
+    # train_dataset = train_dataset.map(
+    #     preprocess_function,
+    #     batched=True,
+    #     num_proc=data_args.preprocessing_num_workers,
+    #     remove_columns=column_names,
+    #     load_from_cache_file=not data_args.overwrite_cache,
+    # )
+    train_dataset = GenDataset(args = data_args, file=datasets['train'],tokenizer=tokenizer)
 
 if training_args.do_eval:
-    max_target_length = data_args.val_max_target_length
-    if "validation" not in datasets:
-        raise ValueError("--do_eval requires a validation dataset")
-    eval_dataset = datasets["validation"]
-    if data_args.max_val_samples is not None:
-        eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
-    eval_dataset = eval_dataset.map(
-        preprocess_function,
-        batched=True,
-        num_proc=data_args.preprocessing_num_workers,
-        remove_columns=column_names,
-        load_from_cache_file=not data_args.overwrite_cache,
-    )
+    # max_target_length = data_args.val_max_target_length
+    # if "validation" not in datasets:
+    #     raise ValueError("--do_eval requires a validation dataset")
+    # eval_dataset = datasets["validation"]
+    # if data_args.max_val_samples is not None:
+    #     eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
+    # eval_dataset = eval_dataset.map(
+    #     preprocess_function,
+    #     batched=True,
+    #     num_proc=data_args.preprocessing_num_workers,
+    #     remove_columns=column_names,
+    #     load_from_cache_file=not data_args.overwrite_cache,
+    # )
+    eval_dataset = GenDataset(args = data_args, file=datasets['validation'],tokenizer=tokenizer)
 
 if training_args.do_predict:
-    max_target_length = data_args.val_max_target_length
-    if "test" not in datasets:
-        raise ValueError("--do_predict requires a test dataset")
-    test_dataset = datasets["test"]
-    if data_args.max_test_samples is not None:
-        test_dataset = test_dataset.select(range(data_args.max_test_samples))
-    test_dataset = test_dataset.map(
-        preprocess_function,
-        batched=True,
-        num_proc=data_args.preprocessing_num_workers,
-        remove_columns=column_names,
-        load_from_cache_file=not data_args.overwrite_cache,
-    )
+    # max_target_length = data_args.val_max_target_length
+    # if "test" not in datasets:
+    #     raise ValueError("--do_predict requires a test dataset")
+    # test_dataset = datasets["test"]
+    # if data_args.max_test_samples is not None:
+    #     test_dataset = test_dataset.select(range(data_args.max_test_samples))
+    # test_dataset = test_dataset.map(
+    #     preprocess_function,
+    #     batched=True,
+    #     num_proc=data_args.preprocessing_num_workers,
+    #     remove_columns=column_names,
+    #     load_from_cache_file=not data_args.overwrite_cache,
+    # )
+    test_dataset = GenDataset(args = data_args, file=datasets['test'],tokenizer=tokenizer)
+
 
 
 max_eval_num=30000
