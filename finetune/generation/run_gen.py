@@ -19,11 +19,11 @@ from utils import DataTrainingArguments, ModelArguments, load_json
 import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from modeling_cpt import CPTModel, CPTForConditionalGeneration
-from transformers.models.bart import BartModel, BartForConditionalGeneration, BartTokenizer
+from modeling_bart import BartForConditionalGeneration
 
 
 class GenDataset(torch.utils.data.Dataset):
-    def __init__(self, args, file, tokenizer: BartTokenizer):
+    def __init__(self, args, file, tokenizer: BertTokenizer):
         self.tokenizer = tokenizer
         self.seq_length = args.max_source_length
 
@@ -50,14 +50,14 @@ class GenDataset(torch.utils.data.Dataset):
         input_ids = []
         attention_mask = []
         labels  = []
-        for item in tqdm(file['data']):
+        for item in tqdm(file['data'][-2:]):
             for position, dialog in enumerate(item['content']):
                 if position == 0:
                     continue
                 assert len(dialog)< self.seq_length
                 with tokenizer.as_target_tokenizer():
                     token_ids_target = self.tokenizer.encode(dialog)
-                labels.append(token_ids_target)
+                labels.append(token_ids_target[1:-1])
                 _position = position
                 cur_length = 0
                 token_ids_input = []
