@@ -1884,11 +1884,14 @@ class MyBartDecoder(BartPretrainedModel):
             config.max_position_embeddings,
             config.d_model,
         )
-        self.shared_layer_num = config.shared_layer_num
-        self.additional_layers_num = config.decoder_layers - config.shared_layer_num
+        
         self.layers = nn.ModuleList([BartDecoderLayer(config) for _ in range(config.decoder_layers)])
-        self.layers_csk = nn.ModuleList([BartDecoderLayer(config) for _ in range(self.additional_layers_num)])
         self.layernorm_embedding = nn.LayerNorm(config.d_model)
+        
+        if config.gen_csk:
+            self.shared_layer_num = config.shared_layer_num
+            self.additional_layers_num = config.decoder_layers - config.shared_layer_num
+            self.layers_csk = nn.ModuleList([BartDecoderLayer(config) for _ in range(self.additional_layers_num)])
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -2057,7 +2060,8 @@ class MyBartDecoder(BartPretrainedModel):
                     raise ValueError(
                         "The `{mask_name}` should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
                     )
-        def recurrent_loop(**args):
+        def recurrent_loop():
+            nonlocal all_hidden_states, hidden_states, use_cache, next_decoder_cache, all_self_attns, all_cross_attentions
             for layers, num in args.items():
                 for idx, decoder_layer in enumerate(layers[:num]):
                     # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
@@ -2129,7 +2133,7 @@ class MyBartDecoder(BartPretrainedModel):
                 self.layers: self.shared_layer_num,
                 self.layers_csk: self.additional_layers_num,
             }
-        recurrent_loop(args)
+        recurrent_loop()
 
 
         # add hidden states from the last decoder layer
@@ -2161,6 +2165,7 @@ class MyBartModel(BartPretrainedModel):
     def __init__(self, config: BartConfig):
         super().__init__(config)
 
+        self.gen_csk = config.gen_csk
         padding_idx, vocab_size = config.pad_token_id, config.vocab_size
         self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
 
@@ -2260,30 +2265,33 @@ class MyBartModel(BartPretrainedModel):
             return_dict=return_dict,
         )
 
-        decoder_outputs_csk = self.decoder(
-            input_ids=decoder_input_ids_csk,
-            attention_mask=decoder_attention_mask,
-            encoder_hidden_states=encoder_outputs[0],
-            encoder_attention_mask=attention_mask,
-            head_mask=decoder_head_mask,
-            cross_attn_head_mask=cross_attn_head_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=decoder_inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            mode = 'CSKG'
-        )
+        decoder_outputs_csk = None
+        if self.gen_csk:
+            decoder_outputs_csk = self.decoder(
+                input_ids=decoder_input_ids_csk,
+                attention_mask=decoder_attention_mask,
+                encoder_hidden_states=encoder_outputs[0],
+                encoder_attention_mask=attention_mask,
+                head_mask=decoder_head_mask,
+                cross_attn_head_mask=cross_attn_head_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=decoder_inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                mode = 'CSKG'
+            )
 
 
 
         if not return_dict:
             return decoder_outputs + encoder_outputs
+        
+        last_hidden_state_csk = decoder_outputs_csk.last_hidden_state if decoder_outputs_csk != None else None
 
-        return Seq2SeqModelOutput(
+        return (last_hidden_state_csk,Seq2SeqModelOutput(
             last_hidden_state=decoder_outputs.last_hidden_state,
-            last_hidden_state_csk = decoder_outputs_csk.last_hidden_state,
             past_key_values=decoder_outputs.past_key_values,
             decoder_hidden_states=decoder_outputs.hidden_states,
             decoder_attentions=decoder_outputs.attentions,
@@ -2291,42 +2299,53 @@ class MyBartModel(BartPretrainedModel):
             encoder_last_hidden_state=encoder_outputs.last_hidden_state,
             encoder_hidden_states=encoder_outputs.hidden_states,
             encoder_attentions=encoder_outputs.attentions,
-        )    
+        ))    
 
+@add_start_docstrings(
+    "The BART Model with a language modeling head. Can be used for summarization.", BART_START_DOCSTRING
+)
 class BartForMultiTaskFinetune(BartPretrainedModel):
     base_model_prefix = "model"
     _keys_to_ignore_on_load_missing = [r"final_logits_bias", r"lm_head\.weight"]
 
-    def __init__(self, config: BartConfig, cls_mode = 1):
-        self.alpha, self.beta, self.omega = config.alpha,config.beta,config.omega
-        assert self.alpha+self.beta+self.omega == 1
+    def __init__(self, config: BartConfig):
         super().__init__(config)
         self.model = MyBartModel(config)
-        cls_mode = getattr(config, 'cls_mode', cls_mode)
-        if cls_mode == 1:
-            logger.info('Encoder for classification.')
-            cls_dim = config.d_model
-        elif cls_mode == 2:
-            logger.info('Decoder for classification.')
-            cls_dim = config.d_model
-        elif cls_mode == 3:
-            logger.info('Both encoder & decoder for classification.')
-            cls_dim = config.d_model * 2
-        else:
-            raise NotImplementedError
 
-        self.cls_head = BartClassificationHead(
-            cls_dim,
-            cls_dim,
-            config.num_labels,
-            config.classifier_dropout,
-        )
-        self.model._init_weights(self.classification_head.dense)
-        self.model._init_weights(self.classification_head.out_proj)
+        self.alpha, self.beta, self.omega = config.alpha,config.beta,config.omega
+        assert self.alpha+self.beta+self.omega == 1
+
+        self.cls = config.cls
+        if self.cls:
+            self.cls_mode = getattr(config, 'cls_mode', config.cls_mode)
+            if self.cls_mode == 1:
+                logger.info('Encoder for classification.')
+                cls_dim = config.d_model
+            elif self.cls_mode == 2:
+                logger.info('Decoder for classification.')
+                cls_dim = config.d_model
+            elif self.cls_mode == 3:
+                logger.info('Both encoder & decoder for classification.')
+                cls_dim = config.d_model * 2
+            else:
+                raise NotImplementedError
+
+            self.cls_head = BartClassificationHead(
+                cls_dim,
+                cls_dim,
+                config.num_labels,
+                config.classifier_dropout,
+            )
+            self.model._init_weights(self.classification_head.dense)
+            self.model._init_weights(self.classification_head.out_proj)
+        
+        self.gen_csk = config.gen_csk
+        if self.gen_csk:
+            self.register_buffer("final_logits_bias_csk", torch.zeros((1, self.model.shared.num_embeddings)))
+            self.lm_head_csk = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
+
         self.register_buffer("final_logits_bias", torch.zeros((1, self.model.shared.num_embeddings)))
-        self.register_buffer("final_logits_bias_csk", torch.zeros((1, self.model.shared.num_embeddings)))
         self.lm_head = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
-        self.lm_head_csk = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
         # Initialize weights and apply final processing
         self.init_weights()
 
@@ -2374,7 +2393,7 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
         inputs_embeds=None,
         decoder_inputs_embeds=None,
         labels_cls=None,
-        labels_dialog_gen=None,
+        labels=None,
         labels_csk_gen=None,
         use_cache=None,
         output_attentions=None,
@@ -2391,10 +2410,10 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if labels_dialog_gen is not None:
+        if labels is not None:
             if decoder_input_ids is None and decoder_inputs_embeds is None:
                 decoder_input_ids = shift_tokens_right(
-                    labels_dialog_gen, self.config.pad_token_id, self.config.decoder_start_token_id
+                    labels, self.config.pad_token_id, self.config.decoder_start_token_id
                 )
 
         outputs = self.model(
@@ -2415,52 +2434,62 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        # 计算分类任务loss
-        hidden_states = outputs.last_hidden_state
-        enc_hidden_states = outputs.encoder_last_hidden_state
-        enc_rep = enc_hidden_states[:, 0]
 
-        eos_mask = input_ids.eq(self.config.eos_token_id)
+        last_hidden_state_csk = outputs[0]
+        outputs = outputs[1]
 
-        if len(torch.unique(eos_mask.sum(1))) > 1:
-            raise ValueError("All examples must have the same number of <eos> tokens.")
-        dec_rep = hidden_states[eos_mask, :].view(hidden_states.size(0), -1, hidden_states.size(-1))[
-            :, -1, :
-        ]
-
-        if self.cls_mode == 1:
-            logits = self.cls_head(enc_rep)
-        elif self.cls_mode == 2:
-            logits = self.cls_head(dec_rep)
-        elif self.cls_mode == 3:
-            rep = torch.cat([enc_rep, dec_rep], dim=-1)
-            logits = self.cls_head(rep)
-        else:
-            raise NotImplementedError
-
-        loss_cls = None
-        if labels_cls is not None:
-            loss_fct = CrossEntropyLoss()
-            loss_cls = loss_fct(logits.view(-1, self.config.num_labels), labels_cls.view(-1))
+        loss = None
 
         # 计算生成loss
         lm_logits = self.lm_head(outputs.last_hidden_state) + self.final_logits_bias
-
+    
         loss_dialog_gen = None
-        if labels_dialog_gen is not None:
+        if labels is not None:
             loss_fct = CrossEntropyLoss()
-            loss_dialog_gen = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels_dialog_gen.view(-1))
+            loss_dialog_gen = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
+        # print(labels,loss_dialog_gen)
+            loss = self.alpha*loss_dialog_gen
 
-        # 计算常识生成loss
-        lm_logits_csk = self.lm_head_csk(outputs.last_hidden_state_csk) + self.final_logits_bias_csk
+        if self.cls:   
+            # 计算分类任务loss
+            hidden_states = outputs.last_hidden_state
+            enc_hidden_states = outputs.encoder_last_hidden_state
+            enc_rep = enc_hidden_states[:, -1]
 
-        loss_csk_gen = None
-        if loss_csk_gen is not None:
-            loss_fct = CrossEntropyLoss()
-            loss_csk_gen = loss_fct(lm_logits_csk.view(-1, self.config.vocab_size), labels_csk_gen.view(-1))
+            eos_mask = input_ids.eq(self.config.eos_token_id)
 
-        # 计算总loss
-        loss = self.alpha*loss_dialog_gen + self.beta*loss_cls + self.omega*loss_csk_gen
+            if len(torch.unique(eos_mask.sum(1))) > 1:
+                raise ValueError("All examples must have the same number of <eos> tokens.")
+            dec_rep = hidden_states[eos_mask, :].view(hidden_states.size(0), -1, hidden_states.size(-1))[
+                :, -1, :
+            ]
+
+            if self.cls_mode == 1:
+                logits = self.cls_head(enc_rep)
+            elif self.cls_mode == 2:
+                logits = self.cls_head(dec_rep)
+            elif self.cls_mode == 3:
+                rep = torch.cat([enc_rep, dec_rep], dim=-1)
+                logits = self.cls_head(rep)
+            else:
+                raise NotImplementedError
+
+            loss_cls = None
+            if labels_cls is not None:
+                loss_fct = CrossEntropyLoss(ignore_index=-1)
+                loss_cls = loss_fct(logits.view(-1, self.config.num_labels), labels_cls.view(-1))
+            loss += self.beta*loss_cls
+
+        if self.gen_csk:
+            # 计算常识生成loss
+            lm_logits_csk = self.lm_head_csk(last_hidden_state_csk) + self.final_logits_bias_csk
+
+            loss_csk_gen = None
+            if loss_csk_gen is not None:
+                loss_fct = CrossEntropyLoss()
+                loss_csk_gen = loss_fct(lm_logits_csk.view(-1, self.config.vocab_size), labels_csk_gen.view(-1))
+            loss += self.omega*loss_csk_gen
+
 
         if not return_dict:
             output = (logits, lm_logits,) + outputs[1:]

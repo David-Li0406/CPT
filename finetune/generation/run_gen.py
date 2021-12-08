@@ -19,7 +19,7 @@ from utils import DataTrainingArguments, ModelArguments, load_json
 import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from modeling_cpt import CPTModel, CPTForConditionalGeneration
-from modeling_bart import BartForConditionalGeneration
+from modeling_bart import BartForConditionalGeneration,BartForMultiTaskFinetune
 
 
 class GenDataset(torch.utils.data.Dataset):
@@ -31,8 +31,9 @@ class GenDataset(torch.utils.data.Dataset):
         self.sep_id = tokenizer.encode('[PAD]')[1]
         self.bos_id = tokenizer.encode('[CLS]')[1]
         self.eos_id = tokenizer.encode('[SEP]')[1]
+        self.emotion2id = {'开心':0,'悲伤':1,'惊讶':2,'生气':3,'others':4}
 
-        self.input_ids, self.attention_mask, self.labels = self.process(file)
+        self.input_ids, self.attention_mask, self.labels, self.labels_cls = self.process(file)
         assert len(self.input_ids) == len(self.attention_mask)
 
     def process(self, file):
@@ -50,6 +51,7 @@ class GenDataset(torch.utils.data.Dataset):
         input_ids = []
         attention_mask = []
         labels  = []
+        labels_cls = []
         for item in tqdm(file['data'][-2:]):
             for position, dialog in enumerate(item['content']):
                 if position == 0:
@@ -58,6 +60,10 @@ class GenDataset(torch.utils.data.Dataset):
                 with tokenizer.as_target_tokenizer():
                     token_ids_target = self.tokenizer.encode(dialog)
                 labels.append(token_ids_target[1:-1])
+                if position-1 >= 0 and item['emotion'][position-1] != 0:
+                    labels_cls.append(self.emotion2id[item['emotion'][position-1]])
+                else:
+                    labels_cls.append(-1)
                 _position = position
                 cur_length = 0
                 token_ids_input = []
@@ -68,7 +74,7 @@ class GenDataset(torch.utils.data.Dataset):
                 input_ids.append([self.bos_id] + token_ids_input[:-1] + [self.eos_id] + [self.pad_id] * (self.seq_length - len(token_ids_input)))
                 attention_mask.append([1 for _ in range(len(token_ids_input)+1)]+[0 for _ in range(self.seq_length - len(token_ids_input))])
                 assert len(input_ids[-1]) == len(attention_mask[-1])
-        return input_ids, attention_mask, labels
+        return input_ids, attention_mask, labels, labels_cls
 
     def __len__(self):
         return len(self.input_ids)
@@ -77,7 +83,8 @@ class GenDataset(torch.utils.data.Dataset):
         return {
             "input_ids":self.input_ids[idx], 
             "attention_mask": self.attention_mask[idx], 
-            "labels":self.labels[idx]
+            "labels":self.labels[idx],
+            # "labels_cls":self.labels_cls[idx],
         }
 
 parser = argparse.ArgumentParser()
@@ -87,6 +94,13 @@ parser.add_argument("--lr",default=2e-5,type=float)
 parser.add_argument("--batch_size",default='50',type=str)
 parser.add_argument("--epoch",default='50',type=str)
 parser.add_argument("--data_dir",default="/path/to/dataset/",type=str)
+# parser.add_argument('--cls',default=False,type=bool)
+# parser.add_argument('--cls_mode',default=3,type=int)
+# parser.add_argument('--gen_csk', default=False,type=bool)
+# parser.add_argument('--alpha', default=1.0,type=float)
+# parser.add_argument('--omega', default=0.0,type=float)
+# parser.add_argument('--beta', default=0.0,type=float)
+
 args = parser.parse_args()
 arg_dict=args.__dict__
 
@@ -124,9 +138,16 @@ args=[
     '--save_strategy','no',
     '--evaluation_strategy','epoch',
     '--learning_rate',str(arg_dict['lr']),
+    # '--cls', arg_dict['cls'],
+    # '--cls_mode',str(arg_dict['cls_mode']),
+    # '--gen_csk', arg_dict['gen_csk'],
+    # '--alpha', str(arg_dict['alpha']),
+    # '--omega', str(arg_dict['omega']),
+    # '--beta', str(arg_dict['beta']),
 ]
 parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments))
 model_args, data_args, training_args = parser.parse_args_into_dataclasses(args)
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -168,7 +189,14 @@ logger.info("Training/evaluation parameters %s", training_args)
 
 tokenizer=BertTokenizer.from_pretrained(model_args.model_name_or_path)
 # model=CPTForConditionalGeneration.from_pretrained(model_args.model_name_or_path)
-model = BartForConditionalGeneration.from_pretrained(model_args.model_name_or_path)
+model = BartForMultiTaskFinetune.from_pretrained(model_args.model_name_or_path,
+                                # cls = model_args.cls,
+                                # cls_model = model_args.cls_mode,
+                                # gen_csk = model_args.gen_csk,
+                                # alpha = model_args.alpha,
+                                # omega = model_args.omega,
+                                # beta = model_args.beta,
+                                )
 model.config.max_length=data_args.val_max_target_length
 
 # text_column='article'
