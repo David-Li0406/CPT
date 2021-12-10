@@ -52,18 +52,18 @@ class GenDataset(torch.utils.data.Dataset):
         attention_mask = []
         labels  = []
         labels_cls = []
-        for item in tqdm(file['data'][-2:]):
+        for item in tqdm(file['data']):
             for position, dialog in enumerate(item['content']):
                 if position == 0:
                     continue
                 assert len(dialog)< self.seq_length
                 with tokenizer.as_target_tokenizer():
                     token_ids_target = self.tokenizer.encode(dialog)
-                labels.append(token_ids_target[1:-1])
+                labels.append(token_ids_target[1:])
                 if position-1 >= 0 and item['emotion'][position-1] != 0:
-                    labels_cls.append(self.emotion2id[item['emotion'][position-1]])
+                    labels_cls.append([self.emotion2id[item['emotion'][position-1]]])
                 else:
-                    labels_cls.append(-1)
+                    labels_cls.append([-1])
                 _position = position
                 cur_length = 0
                 token_ids_input = []
@@ -80,6 +80,12 @@ class GenDataset(torch.utils.data.Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, idx):
+        # print({
+        #     "input_ids":self.input_ids[idx], 
+        #     "attention_mask": self.attention_mask[idx], 
+        #     "labels":self.labels[idx],
+        #     "labels_cls":self.labels_cls[idx],
+        # })
         return {
             "input_ids":self.input_ids[idx], 
             "attention_mask": self.attention_mask[idx], 
@@ -94,12 +100,6 @@ parser.add_argument("--lr",default=2e-5,type=float)
 parser.add_argument("--batch_size",default='50',type=str)
 parser.add_argument("--epoch",default='50',type=str)
 parser.add_argument("--data_dir",default="/path/to/dataset/",type=str)
-# parser.add_argument('--cls',default=False,type=bool)
-# parser.add_argument('--cls_mode',default=3,type=int)
-# parser.add_argument('--gen_csk', default=False,type=bool)
-# parser.add_argument('--alpha', default=1.0,type=float)
-# parser.add_argument('--omega', default=0.0,type=float)
-# parser.add_argument('--beta', default=0.0,type=float)
 
 args = parser.parse_args()
 arg_dict=args.__dict__
@@ -138,12 +138,6 @@ args=[
     '--save_strategy','no',
     '--evaluation_strategy','epoch',
     '--learning_rate',str(arg_dict['lr']),
-    # '--cls', arg_dict['cls'],
-    # '--cls_mode',str(arg_dict['cls_mode']),
-    # '--gen_csk', arg_dict['gen_csk'],
-    # '--alpha', str(arg_dict['alpha']),
-    # '--omega', str(arg_dict['omega']),
-    # '--beta', str(arg_dict['beta']),
 ]
 parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments))
 model_args, data_args, training_args = parser.parse_args_into_dataclasses(args)
@@ -190,81 +184,17 @@ logger.info("Training/evaluation parameters %s", training_args)
 tokenizer=BertTokenizer.from_pretrained(model_args.model_name_or_path)
 # model=CPTForConditionalGeneration.from_pretrained(model_args.model_name_or_path)
 model = BartForMultiTaskFinetune.from_pretrained(model_args.model_name_or_path,
-                                # cls = model_args.cls,
-                                # cls_model = model_args.cls_mode,
-                                # gen_csk = model_args.gen_csk,
-                                # alpha = model_args.alpha,
-                                # omega = model_args.omega,
-                                # beta = model_args.beta,
                                 )
 model.config.max_length=data_args.val_max_target_length
 
-# text_column='article'
-# summary_column='summarization'
-# column_names = datasets["train"].column_names
-# max_target_length = data_args.val_max_target_length
-# padding=False
-
-# def preprocess_function(examples):
-#     inputs = examples[text_column]
-#     targets = examples[summary_column]
-#     model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
-
-#     # Setup the tokenizer for targets
-#     with tokenizer.as_target_tokenizer():
-#         labels = tokenizer(targets, max_length=max_target_length, padding=padding, truncation=True)
-
-
-#     model_inputs["labels"] = labels["input_ids"]
-#     return model_inputs
-
-
 
 if training_args.do_train:
-    # train_dataset = datasets["train"]
-    # if "train" not in datasets:
-    #     raise ValueError("--do_train requires a train dataset")
-    # if data_args.max_train_samples is not None:
-    #     train_dataset = train_dataset.select(range(data_args.max_train_samples))
-    # train_dataset = train_dataset.map(
-    #     preprocess_function,
-    #     batched=True,
-    #     num_proc=data_args.preprocessing_num_workers,
-    #     remove_columns=column_names,
-    #     load_from_cache_file=not data_args.overwrite_cache,
-    # )
     train_dataset = GenDataset(args = data_args, file=datasets['train'],tokenizer=tokenizer)
 
 if training_args.do_eval:
-    # max_target_length = data_args.val_max_target_length
-    # if "validation" not in datasets:
-    #     raise ValueError("--do_eval requires a validation dataset")
-    # eval_dataset = datasets["validation"]
-    # if data_args.max_val_samples is not None:
-    #     eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
-    # eval_dataset = eval_dataset.map(
-    #     preprocess_function,
-    #     batched=True,
-    #     num_proc=data_args.preprocessing_num_workers,
-    #     remove_columns=column_names,
-    #     load_from_cache_file=not data_args.overwrite_cache,
-    # )
     eval_dataset = GenDataset(args = data_args, file=datasets['validation'],tokenizer=tokenizer)
 
 if training_args.do_predict:
-    # max_target_length = data_args.val_max_target_length
-    # if "test" not in datasets:
-    #     raise ValueError("--do_predict requires a test dataset")
-    # test_dataset = datasets["test"]
-    # if data_args.max_test_samples is not None:
-    #     test_dataset = test_dataset.select(range(data_args.max_test_samples))
-    # test_dataset = test_dataset.map(
-    #     preprocess_function,
-    #     batched=True,
-    #     num_proc=data_args.preprocessing_num_workers,
-    #     remove_columns=column_names,
-    #     load_from_cache_file=not data_args.overwrite_cache,
-    # )
     test_dataset = GenDataset(args = data_args, file=datasets['test'],tokenizer=tokenizer)
 
 
@@ -293,10 +223,6 @@ rouge = Rouge()
 def postprocess_text(preds, labels):
     preds = [pred.strip() for pred in preds]
     labels = [label.strip() for label in labels]
-
-    # # rougeLSum expects newline after each sentence
-    # preds = ["\n".join(nltk.sent_tokenize(pred)) for pred in preds]
-    # labels = ["\n".join(nltk.sent_tokenize(label)) for label in labels]
 
     while '' in preds:
         idx=preds.index('')

@@ -14,6 +14,7 @@
 # limitations under the License.
 """ PyTorch BART model. """
 import copy
+from json import decoder
 import math
 import random
 import warnings
@@ -2330,7 +2331,7 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
             else:
                 raise NotImplementedError
 
-            self.cls_head = BartClassificationHead(
+            self.classification_head = BartClassificationHead(
                 cls_dim,
                 cls_dim,
                 config.num_labels,
@@ -2409,7 +2410,6 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
         Returns:
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         if labels is not None:
             if decoder_input_ids is None and decoder_inputs_embeds is None:
                 decoder_input_ids = shift_tokens_right(
@@ -2454,10 +2454,12 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
             # 计算分类任务loss
             hidden_states = outputs.last_hidden_state
             enc_hidden_states = outputs.encoder_last_hidden_state
-            enc_rep = enc_hidden_states[:, -1]
+            enc_rep = enc_hidden_states[:, 0]
 
-            eos_mask = input_ids.eq(self.config.eos_token_id)
-
+            eos_mask = torch.zeros_like(decoder_input_ids)
+            choosen_idx = [ids.masked_select(ids>0).size(0)-1 for ids in decoder_input_ids]
+            # print(choosen_idx)
+            eos_mask[:, choosen_idx] = True
             if len(torch.unique(eos_mask.sum(1))) > 1:
                 raise ValueError("All examples must have the same number of <eos> tokens.")
             dec_rep = hidden_states[eos_mask, :].view(hidden_states.size(0), -1, hidden_states.size(-1))[
@@ -2465,12 +2467,12 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
             ]
 
             if self.cls_mode == 1:
-                logits = self.cls_head(enc_rep)
+                logits = self.classification_head(enc_rep)
             elif self.cls_mode == 2:
-                logits = self.cls_head(dec_rep)
+                logits = self.classification_head(dec_rep)
             elif self.cls_mode == 3:
                 rep = torch.cat([enc_rep, dec_rep], dim=-1)
-                logits = self.cls_head(rep)
+                logits = self.classification_head(rep)
             else:
                 raise NotImplementedError
 
@@ -2478,7 +2480,8 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
             if labels_cls is not None:
                 loss_fct = CrossEntropyLoss(ignore_index=-1)
                 loss_cls = loss_fct(logits.view(-1, self.config.num_labels), labels_cls.view(-1))
-            loss += self.beta*loss_cls
+                print(loss_cls)
+                loss += self.beta*loss_cls
 
         if self.gen_csk:
             # 计算常识生成loss
@@ -2488,7 +2491,7 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
             if loss_csk_gen is not None:
                 loss_fct = CrossEntropyLoss()
                 loss_csk_gen = loss_fct(lm_logits_csk.view(-1, self.config.vocab_size), labels_csk_gen.view(-1))
-            loss += self.omega*loss_csk_gen
+                loss += self.omega*loss_csk_gen
 
 
         if not return_dict:
