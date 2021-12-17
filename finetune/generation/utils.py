@@ -23,24 +23,24 @@ class ModelArguments:
     model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
-    # cls: Optional[bool] = field(
-    #     default=None, metadata={"help": ""}
-    # )
-    # cls_mode: Optional[str] = field(
-    #     default=None, metadata={"help": ""}
-    # )
-    # gen_csk: Optional[bool] = field(
-    #     default=None, metadata={"help": ""}
-    # )
-    # alpha: Optional[str] = field(
-    #     default=None, metadata={"help": ""}
-    # )
-    # omega: Optional[str] = field(
-    #     default=None, metadata={"help": ""}
-    # )
-    # beta: Optional[str] = field(
-    #     default=None, metadata={"help": ""}
-    # )
+    cls_emo: Optional[bool] = field(
+        default=False, metadata={"help": ""}
+    )
+    cls_mode: Optional[str] = field(
+        default=1, metadata={"help": ""}
+    )
+    gen_csk: Optional[bool] = field(
+        default=None, metadata={"help": ""}
+    )
+    alpha: Optional[str] = field(
+        default=1.0, metadata={"help": ""}
+    )
+    omega: Optional[str] = field(
+        default=0.0, metadata={"help": ""}
+    )
+    beta: Optional[str] = field(
+        default=0.0, metadata={"help": ""}
+    )
     tokenizer_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )

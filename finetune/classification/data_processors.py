@@ -36,7 +36,7 @@ class DataProcessor(object):
     @classmethod
     def _read_json(cls, input_file):
         """Reads a json list file."""
-        with open(input_file, "r") as f:
+        with open(input_file, "r", encoding="utf8") as f:
             reader = f.readlines()
             lines = []
             for line in reader:

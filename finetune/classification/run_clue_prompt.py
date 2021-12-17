@@ -135,6 +135,7 @@ def main():
 
     # Setup CUDA, GPU & distributed training
     args.device = "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
+    
     args.n_gpu = torch.cuda.device_count()
 
     # Prepare task
@@ -174,10 +175,10 @@ def main():
 
         args.metrics = METRICS.get(args.task_name, DEFAULT_METRICS)
 
-        args.device = 'cpu' if args.no_cuda else 'cuda'
+        # args.device = 'cpu' if args.no_cuda else 'cuda'
 
         if 'yfshao' not in args.model_name_or_path:
-            tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+            tokenizer = BertTokenizer.from_pretrained(args.model_name_or_path)
             model = AutoModelForMaskedLM.from_pretrained(pretrained_model_name_or_path=args.model_name_or_path)
             prompts = templates.TEMPLATES[args.task_name](tokenizer, args)
             cls_mode = -1

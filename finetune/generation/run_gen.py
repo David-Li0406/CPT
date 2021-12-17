@@ -5,16 +5,19 @@ import os
 import random
 import sys
 from tqdm import tqdm
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import numpy as np
 import torch
 import transformers
 from transformers import (AutoConfig, AutoModel, BertTokenizer,BertForTokenClassification,
-                          DataCollatorForTokenClassification, HfArgumentParser,DataCollatorForSeq2Seq,Seq2SeqTrainer,
+                          DataCollatorForTokenClassification, HfArgumentParser,DataCollatorForSeq2Seq,Seq2SeqTrainer, TrainingArguments, 
                           Seq2SeqTrainingArguments, Trainer, TrainerCallback,AutoModelForSeq2SeqLM)
 from transformers.trainer_utils import is_main_process
 from datasets import load_metric,Dataset
 from utils import DataTrainingArguments, ModelArguments, load_json
+from transformers import EarlyStoppingCallback
 
 import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -23,9 +26,11 @@ from modeling_bart import BartForConditionalGeneration,BartForMultiTaskFinetune
 
 
 class GenDataset(torch.utils.data.Dataset):
-    def __init__(self, args, file, tokenizer: BertTokenizer):
+    def __init__(self, args, file, tokenizer: BertTokenizer, cls_emo, cls_mode):
         self.tokenizer = tokenizer
         self.seq_length = args.max_source_length
+        self.cls_emo = cls_emo
+        self.cls_mode = cls_mode
 
         self.pad_id = tokenizer.encode('[PAD]')[1]
         self.sep_id = tokenizer.encode('[PAD]')[1]
@@ -51,7 +56,9 @@ class GenDataset(torch.utils.data.Dataset):
         input_ids = []
         attention_mask = []
         labels  = []
-        labels_cls = []
+        labels_cls = None
+        if self.cls_emo:
+            labels_cls = []
         for item in tqdm(file['data']):
             for position, dialog in enumerate(item['content']):
                 if position == 0:
@@ -60,10 +67,11 @@ class GenDataset(torch.utils.data.Dataset):
                 with tokenizer.as_target_tokenizer():
                     token_ids_target = self.tokenizer.encode(dialog)
                 labels.append(token_ids_target[1:])
-                if position-1 >= 0 and item['emotion'][position-1] != 0:
-                    labels_cls.append([self.emotion2id[item['emotion'][position-1]]])
-                else:
-                    labels_cls.append([-1])
+                if self.cls_emo:
+                    if position-1 >= 0 and item['emotion'][position-1] != 0:
+                        labels_cls.append([self.emotion2id[item['emotion'][position-1]]])
+                    else:
+                        labels_cls.append([-1])
                 _position = position
                 cur_length = 0
                 token_ids_input = []
@@ -80,43 +88,54 @@ class GenDataset(torch.utils.data.Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, idx):
-        # print({
-        #     "input_ids":self.input_ids[idx], 
-        #     "attention_mask": self.attention_mask[idx], 
-        #     "labels":self.labels[idx],
-        #     "labels_cls":self.labels_cls[idx],
-        # })
-        return {
-            "input_ids":self.input_ids[idx], 
-            "attention_mask": self.attention_mask[idx], 
-            "labels":self.labels[idx],
-            # "labels_cls":self.labels_cls[idx],
-        }
+        if self.cls_emo:
+            return {
+                "input_ids":self.input_ids[idx], 
+                "attention_mask": self.attention_mask[idx], 
+                "labels":self.labels[idx],
+                "labels_cls":self.labels_cls[idx],
+            }
+        else:
+            return{
+                "input_ids":self.input_ids[idx], 
+                "attention_mask": self.attention_mask[idx], 
+                "labels":self.labels[idx],  
+            }
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_path",default='/path/to/model',type=str)
+parser.add_argument("--model_name",default='bart-base-chinese-finetune',type=str)
 parser.add_argument("--dataset", default="lcsts",type=str)
 parser.add_argument("--lr",default=2e-5,type=float)
 parser.add_argument("--batch_size",default='50',type=str)
 parser.add_argument("--epoch",default='50',type=str)
 parser.add_argument("--data_dir",default="/path/to/dataset/",type=str)
+parser.add_argument("--local_rank", default=-1, type=int)
+parser.add_argument("--cls_emo", default=False, type=bool)
+parser.add_argument("--cls_mode", default=1, type=int)
+parser.add_argument("--gen_csk", default=False, type=bool)
+parser.add_argument("--alpha", default=1.0, type=float)
+parser.add_argument("--beta", default=0.0, type=float)
+parser.add_argument("--omega", default=0.0, type=float)
 
 args = parser.parse_args()
 arg_dict=args.__dict__
+# local_rank = args.local_rank
+# torch.cuda.set_device(local_rank)
 
 logger = logging.getLogger(__name__)
 
 dataset_name=arg_dict['dataset']
-outdir_1='output'
-if not os.path.exists(outdir_1):
-    os.mkdir(outdir_1)
+outdir_base='output'
+if not os.path.exists(outdir_base):
+    os.mkdir(outdir_base)
 
-outdir=outdir_1+'/'+dataset_name
+outdir=outdir_base+'/'+dataset_name
 if not os.path.exists(outdir):
     os.mkdir(outdir)
 
 seed=len(os.listdir(outdir))+1
-outdir=outdir+'/'+str(args.epoch)+'/'+str(seed)
+outdir=outdir+'/'+args.model_name
 length_map={'lcsts':'30','csl':'50','adgen':'128','cconv':'128'}
 
 
@@ -133,14 +152,27 @@ args=[
     '--max_source_length=128',
     '--val_max_target_length='+length_map[arg_dict['dataset']],
     '--predict_with_generate=1',
-    '--seed',str(1000*seed),
+    '--seed',str(args.local_rank+1),
     '--num_train_epochs',arg_dict['epoch'],
     '--save_strategy','no',
     '--evaluation_strategy','epoch',
     '--learning_rate',str(arg_dict['lr']),
+    '--load_best_model_at_end',str(True), 
+    '--metric_for_best_model',"eval_rouge-l", 
+    '--greater_is_better',str(False),
+    '--save_total_limit', str(2),
+    '--cls_emo', str(args.cls_emo),
+    '--cls_mode', str(args.cls_mode),
+    '--gen_csk', str(args.gen_csk),
+    '--beta',str(args.beta),
+    '--alpha',str(args.alpha),
+    '--omega',str(args.omega),
 ]
+
 parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments))
 model_args, data_args, training_args = parser.parse_args_into_dataclasses(args)
+
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -181,21 +213,34 @@ if is_main_process(training_args.local_rank):
     transformers.utils.logging.set_verbosity_info()
 logger.info("Training/evaluation parameters %s", training_args)
 
+def add_emotion_token(tokenizer, model):
+    tokenizer.add_special_tokens({'additional_special_tokens':["<happy>","<sad>","<surprise>","<angry>","<others>"]})
+    model.resize_token_embedding(len(tokenizer))
+
 tokenizer=BertTokenizer.from_pretrained(model_args.model_name_or_path)
-# model=CPTForConditionalGeneration.from_pretrained(model_args.model_name_or_path)
-model = BartForMultiTaskFinetune.from_pretrained(model_args.model_name_or_path,
-                                )
+model = BartForMultiTaskFinetune.from_pretrained(model_args.model_name_or_path, 
+                                                tokenizer = tokenizer, 
+                                                cls_emo = model_args.cls_emo, 
+                                                cls_mode = int(model_args.cls_mode),
+                                                gen_csk = model_args.gen_csk,
+                                                alpha = float(model_args.alpha),
+                                                beta = float(model_args.beta),
+                                                omega = float(model_args.omega),)
 model.config.max_length=data_args.val_max_target_length
+
+# device = torch.device("cuda", local_rank)
+# model.to(device)
+# model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
 
 if training_args.do_train:
-    train_dataset = GenDataset(args = data_args, file=datasets['train'],tokenizer=tokenizer)
+    train_dataset = GenDataset(args = data_args, file=datasets['train'], tokenizer=tokenizer, cls_emo=model_args.cls_emo, cls_mode=model_args.cls_mode)
 
 if training_args.do_eval:
-    eval_dataset = GenDataset(args = data_args, file=datasets['validation'],tokenizer=tokenizer)
+    eval_dataset = GenDataset(args = data_args, file=datasets['validation'],tokenizer=tokenizer, cls_emo=model_args.cls_emo, cls_mode=model_args.cls_mode)
 
 if training_args.do_predict:
-    test_dataset = GenDataset(args = data_args, file=datasets['test'],tokenizer=tokenizer)
+    test_dataset = GenDataset(args = data_args, file=datasets['test'],tokenizer=tokenizer, cls_emo=model_args.cls_emo, cls_mode=model_args.cls_mode)
 
 
 
@@ -287,9 +332,9 @@ if training_args.do_train:
     trainer.save_metrics("train", metrics)
     trainer.save_state()
 
-if trainer.is_world_process_zero():
-    if training_args.predict_with_generate:
-        predictions, labels, metrics = trainer.predict(test_dataset, metric_key_prefix="predict")
+if training_args.predict_with_generate:
+    predictions, labels, metrics = trainer.predict(test_dataset, metric_key_prefix="predict")
+    if trainer.is_world_process_zero():
         test_preds = tokenizer.batch_decode(
             predictions, skip_special_tokens=True,
         )

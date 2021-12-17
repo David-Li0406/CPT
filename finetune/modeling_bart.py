@@ -31,20 +31,20 @@ from transformers.file_utils import (
     add_end_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
-    replace_return_docstrings,
+    replace_return_docstrings,ModelOutput
 )
 from transformers.modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
     Seq2SeqLMOutput,
-    Seq2SeqModelOutput,
     Seq2SeqQuestionAnsweringModelOutput,
     Seq2SeqSequenceClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 from transformers import BartConfig
+from dataclasses import dataclass
 
 
 logger = logging.get_logger(__name__)
@@ -58,6 +58,69 @@ BART_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "facebook/bart-large",
     # See all BART models at https://huggingface.co/models?filter=bart
 ]
+
+@dataclass
+class Seq2SeqModelOutput(ModelOutput):
+    """
+    Base class for model encoder's outputs that also contains : pre-computed hidden states that can speed up sequential
+    decoding.
+
+    Args:
+        last_hidden_state (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the decoder of the model.
+
+            If :obj:`past_key_values` is used only the last hidden-state of the sequences of shape :obj:`(batch_size,
+            1, hidden_size)` is output.
+        past_key_values (:obj:`tuple(tuple(torch.FloatTensor))`, `optional`, returned when ``use_cache=True`` is passed or when ``config.use_cache=True``):
+            Tuple of :obj:`tuple(torch.FloatTensor)` of length :obj:`config.n_layers`, with each tuple having 2 tensors
+            of shape :obj:`(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of
+            shape :obj:`(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
+
+            Contains pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
+            blocks) that can be used (see :obj:`past_key_values` input) to speed up sequential decoding.
+        decoder_hidden_states (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``output_hidden_states=True`` is passed or when ``config.output_hidden_states=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer)
+            of shape :obj:`(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the decoder at the output of each layer plus the initial embedding outputs.
+        decoder_attentions (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``output_attentions=True`` is passed or when ``config.output_attentions=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for each layer) of shape :obj:`(batch_size, num_heads,
+            sequence_length, sequence_length)`.
+
+            Attentions weights of the decoder, after the attention softmax, used to compute the weighted average in the
+            self-attention heads.
+        cross_attentions (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``output_attentions=True`` is passed or when ``config.output_attentions=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for each layer) of shape :obj:`(batch_size, num_heads,
+            sequence_length, sequence_length)`.
+
+            Attentions weights of the decoder's cross-attention layer, after the attention softmax, used to compute the
+            weighted average in the cross-attention heads.
+        encoder_last_hidden_state (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
+            Sequence of hidden-states at the output of the last layer of the encoder of the model.
+        encoder_hidden_states (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``output_hidden_states=True`` is passed or when ``config.output_hidden_states=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer)
+            of shape :obj:`(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the encoder at the output of each layer plus the initial embedding outputs.
+        encoder_attentions (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``output_attentions=True`` is passed or when ``config.output_attentions=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for each layer) of shape :obj:`(batch_size, num_heads,
+            sequence_length, sequence_length)`.
+
+            Attentions weights of the encoder, after the attention softmax, used to compute the weighted average in the
+            self-attention heads.
+    """
+
+    last_hidden_state: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    decoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    decoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_last_hidden_state: Optional[torch.FloatTensor] = None
+    encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    last_hidden_state_csk: Optional[torch.FloatTensor] = None
+    cls_logits: Optional[torch.FloatTensor] = None
+    labels: Optional[torch.IntTensor] = None
 
 
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
@@ -1868,7 +1931,7 @@ class MyBartDecoder(BartPretrainedModel):
         embed_tokens (nn.Embedding): output embedding
     """
 
-    def __init__(self, config: BartConfig, embed_tokens: Optional[nn.Embedding] = None):
+    def __init__(self, config: BartConfig, embed_tokens: Optional[nn.Embedding] = None, gen_csk=None):
         super().__init__(config)
         self.dropout = config.dropout
         self.layerdrop = config.decoder_layerdrop
@@ -1889,7 +1952,7 @@ class MyBartDecoder(BartPretrainedModel):
         self.layers = nn.ModuleList([BartDecoderLayer(config) for _ in range(config.decoder_layers)])
         self.layernorm_embedding = nn.LayerNorm(config.d_model)
         
-        if config.gen_csk:
+        if gen_csk:
             self.shared_layer_num = config.shared_layer_num
             self.additional_layers_num = config.decoder_layers - config.shared_layer_num
             self.layers_csk = nn.ModuleList([BartDecoderLayer(config) for _ in range(self.additional_layers_num)])
@@ -2163,15 +2226,17 @@ class MyBartDecoder(BartPretrainedModel):
     BART_START_DOCSTRING,
 )
 class MyBartModel(BartPretrainedModel):
-    def __init__(self, config: BartConfig):
+    def __init__(self, config: BartConfig, classification_head = None, gen_csk=None, tokenizer=None):
         super().__init__(config)
 
-        self.gen_csk = config.gen_csk
+        self.gen_csk = gen_csk
+        self.tokenizer = tokenizer
         padding_idx, vocab_size = config.pad_token_id, config.vocab_size
         self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
+        self.classification_head = classification_head
 
         self.encoder = BartEncoder(config, self.shared)
-        self.decoder = MyBartDecoder(config, self.shared)
+        self.decoder = MyBartDecoder(config, self.shared, gen_csk)
 
         # Initialize weights and apply final processing
         self.init_weights()
@@ -2215,6 +2280,8 @@ class MyBartModel(BartPretrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        labels_cls = None,
+        labels=None
     ):
 
         # different to other models, Bart automatically creates decoder_input_ids from
@@ -2248,6 +2315,25 @@ class MyBartModel(BartPretrainedModel):
                 hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
             )
+        
+        cls_logits = None
+        if self.classification_head:
+            if labels_cls == None:
+                if len(torch.unique(decoder_input_ids.sum(1))) == 1 and decoder_input_ids[0,0] == 102:
+                    enc_hidden_states = encoder_outputs.last_hidden_state if return_dict else encoder_outputs[0]
+                    enc_rep = enc_hidden_states[:, 0]
+                    cls_logits = self.classification_head(enc_rep)
+                    items = torch.argmax(cls_logits,dim=1)
+                    emotion_label = torch.tensor(self.tokenizer.encode(["[unused{}]".format(item+1) for item in items])[1:-1]).to(decoder_input_ids.device)
+                    decoder_input_ids = torch.cat([decoder_input_ids[:,0].unsqueeze(dim=-1), emotion_label.unsqueeze(dim=-1), decoder_input_ids[:,1:]],dim=-1)
+            else:
+                enc_hidden_states = encoder_outputs.last_hidden_state if return_dict else encoder_outputs[0]
+                enc_rep = enc_hidden_states[:, 0]
+                cls_logits = self.classification_head(enc_rep)
+                emotion_label = torch.tensor(self.tokenizer.encode(["[unused{}]".format(item+1 if item != -1 else 6) for item in labels_cls.squeeze()])[1:-1]).to(decoder_input_ids.device)
+                decoder_input_ids = torch.cat([decoder_input_ids[:,0].unsqueeze(dim=-1), emotion_label.unsqueeze(dim=-1), decoder_input_ids[:,1:]],dim=-1)
+                labels = torch.cat([labels[:,0].unsqueeze(dim=-1), torch.zeros(labels.size(0),1).fill_(-100).to(decoder_input_ids.device), labels[:,1:]],dim=-1).long()
+
 
         # for dialogue generation
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
@@ -2291,7 +2377,7 @@ class MyBartModel(BartPretrainedModel):
         
         last_hidden_state_csk = decoder_outputs_csk.last_hidden_state if decoder_outputs_csk != None else None
 
-        return (last_hidden_state_csk,Seq2SeqModelOutput(
+        return Seq2SeqModelOutput(
             last_hidden_state=decoder_outputs.last_hidden_state,
             past_key_values=decoder_outputs.past_key_values,
             decoder_hidden_states=decoder_outputs.hidden_states,
@@ -2300,7 +2386,10 @@ class MyBartModel(BartPretrainedModel):
             encoder_last_hidden_state=encoder_outputs.last_hidden_state,
             encoder_hidden_states=encoder_outputs.hidden_states,
             encoder_attentions=encoder_outputs.attentions,
-        ))    
+            last_hidden_state_csk=last_hidden_state_csk,
+            cls_logits=cls_logits,
+            labels=labels,
+        )
 
 @add_start_docstrings(
     "The BART Model with a language modeling head. Can be used for summarization.", BART_START_DOCSTRING
@@ -2309,16 +2398,15 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
     base_model_prefix = "model"
     _keys_to_ignore_on_load_missing = [r"final_logits_bias", r"lm_head\.weight"]
 
-    def __init__(self, config: BartConfig):
+    def __init__(self, config: BartConfig, tokenizer=None, cls_emo=False, cls_mode=1, gen_csk=False, alpha=1.0, beta=0.0, omega=0.0):
         super().__init__(config)
-        self.model = MyBartModel(config)
 
-        self.alpha, self.beta, self.omega = config.alpha,config.beta,config.omega
-        assert self.alpha+self.beta+self.omega == 1
+        self.alpha, self.beta, self.omega = alpha,beta,omega
+        assert self.alpha+self.beta+self.omega == 1.0
 
-        self.cls = config.cls
+        self.cls = cls_emo
         if self.cls:
-            self.cls_mode = getattr(config, 'cls_mode', config.cls_mode)
+            self.cls_mode = cls_mode
             if self.cls_mode == 1:
                 logger.info('Encoder for classification.')
                 cls_dim = config.d_model
@@ -2330,17 +2418,20 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
                 cls_dim = config.d_model * 2
             else:
                 raise NotImplementedError
-
             self.classification_head = BartClassificationHead(
                 cls_dim,
                 cls_dim,
-                config.num_labels,
+                config.num_class,
                 config.classifier_dropout,
             )
+            if self.cls_mode == 1:
+                self.model = MyBartModel(config, classification_head = self.classification_head, gen_csk=gen_csk, tokenizer=tokenizer)
+            else:
+                self.model = MyBartModel(config, gen_csk=gen_csk, tokenizer=tokenizer)
             self.model._init_weights(self.classification_head.dense)
             self.model._init_weights(self.classification_head.out_proj)
         
-        self.gen_csk = config.gen_csk
+        self.gen_csk = gen_csk
         if self.gen_csk:
             self.register_buffer("final_logits_bias_csk", torch.zeros((1, self.model.shared.num_embeddings)))
             self.lm_head_csk = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
@@ -2349,6 +2440,8 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
         self.lm_head = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
         # Initialize weights and apply final processing
         self.init_weights()
+        
+        self.tokenizer = tokenizer
 
     def get_encoder(self):
         return self.model.get_encoder()
@@ -2433,10 +2526,9 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            labels_cls=labels_cls,
+            labels=labels,
         )
-
-        last_hidden_state_csk = outputs[0]
-        outputs = outputs[1]
 
         loss = None
 
@@ -2446,46 +2538,43 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
         loss_dialog_gen = None
         if labels is not None:
             loss_fct = CrossEntropyLoss()
-            loss_dialog_gen = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
-        # print(labels,loss_dialog_gen)
+            loss_dialog_gen = loss_fct(lm_logits.view(-1, self.config.vocab_size), outputs.labels.view(-1))
             loss = self.alpha*loss_dialog_gen
 
-        if self.cls:   
-            # 计算分类任务loss
-            hidden_states = outputs.last_hidden_state
-            enc_hidden_states = outputs.encoder_last_hidden_state
-            enc_rep = enc_hidden_states[:, 0]
+        if self.cls:
+            cls_logits = outputs.cls_logits
+            if cls_logits == None:  
+                # 计算分类任务loss
+                hidden_states = outputs.last_hidden_state
+                enc_hidden_states = outputs.encoder_last_hidden_state
+                enc_rep = enc_hidden_states[:, 0]
 
-            eos_mask = torch.zeros_like(decoder_input_ids)
-            choosen_idx = [ids.masked_select(ids>0).size(0)-1 for ids in decoder_input_ids]
-            # print(choosen_idx)
-            eos_mask[:, choosen_idx] = True
-            if len(torch.unique(eos_mask.sum(1))) > 1:
-                raise ValueError("All examples must have the same number of <eos> tokens.")
-            dec_rep = hidden_states[eos_mask, :].view(hidden_states.size(0), -1, hidden_states.size(-1))[
-                :, -1, :
-            ]
+                eos_mask = torch.zeros_like(decoder_input_ids)
+                choosen_idx = [ids.masked_select(ids>0).size(0)-1 for ids in decoder_input_ids]
+                eos_mask[:, choosen_idx] = True
+                if len(torch.unique(eos_mask.sum(1))) > 1:
+                    raise ValueError("All examples must have the same number of <eos> tokens.")
+                dec_rep = hidden_states[eos_mask, :].view(hidden_states.size(0), -1, hidden_states.size(-1))[
+                    :, -1, :
+                ]
 
-            if self.cls_mode == 1:
-                logits = self.classification_head(enc_rep)
-            elif self.cls_mode == 2:
-                logits = self.classification_head(dec_rep)
-            elif self.cls_mode == 3:
-                rep = torch.cat([enc_rep, dec_rep], dim=-1)
-                logits = self.classification_head(rep)
-            else:
-                raise NotImplementedError
+                if self.cls_mode == 2:
+                    cls_logits = self.classification_head(dec_rep)
+                elif self.cls_mode == 3:
+                    rep = torch.cat([enc_rep, dec_rep], dim=-1)
+                    cls_logits = self.classification_head(rep)
+                else:
+                    raise NotImplementedError
 
             loss_cls = None
             if labels_cls is not None:
                 loss_fct = CrossEntropyLoss(ignore_index=-1)
-                loss_cls = loss_fct(logits.view(-1, self.config.num_labels), labels_cls.view(-1))
-                print(loss_cls)
+                loss_cls = loss_fct(cls_logits.view(-1, self.config.num_class), labels_cls.view(-1))
                 loss += self.beta*loss_cls
 
         if self.gen_csk:
             # 计算常识生成loss
-            lm_logits_csk = self.lm_head_csk(last_hidden_state_csk) + self.final_logits_bias_csk
+            lm_logits_csk = self.lm_head_csk(outputs.last_hidden_state_csk) + self.final_logits_bias_csk
 
             loss_csk_gen = None
             if loss_csk_gen is not None:
@@ -2495,7 +2584,7 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
 
 
         if not return_dict:
-            output = (logits, lm_logits,) + outputs[1:]
+            output = (cls_logits, lm_logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return Seq2SeqLMOutput(

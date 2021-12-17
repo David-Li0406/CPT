@@ -189,6 +189,7 @@ def finetune(args, model, tokenizer, prompts: PromptTemplate, train_data, eval_d
     train_batch_size = args.per_gpu_train_batch_size * args.gradient_accumulation_steps
     gradient_accumulation_steps = args.gradient_accumulation_steps
     per_gpu_train_batch_size = args.per_gpu_train_batch_size
+    print(args.device)
     model.to(args.device)
     converter = Converter(args, tokenizer, prompts)
 
