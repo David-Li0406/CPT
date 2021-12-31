@@ -26,22 +26,77 @@ from modeling_bart import BartForConditionalGeneration,BartForMultiTaskFinetune
 
 
 class GenDataset(torch.utils.data.Dataset):
-    def __init__(self, args, file, tokenizer: BertTokenizer, cls_emo, cls_mode):
+    def __init__(self, args, file, tokenizer: BertTokenizer, cls_emo, cls_mode, add_enc=False, mode='turn', turn_num=8):
+        if add_enc and cls_emo:
+             raise ValueError("Can't add emotion labels to encoder and predict it in the same time")
         self.tokenizer = tokenizer
-        self.seq_length = args.max_source_length
+        if mode == 'length':
+            self.seq_length = args.max_source_length
+        else:
+            self.turn_num = turn_num
         self.cls_emo = cls_emo
         self.cls_mode = cls_mode
 
-        self.pad_id = tokenizer.encode('[PAD]')[1]
-        self.sep_id = tokenizer.encode('[PAD]')[1]
-        self.bos_id = tokenizer.encode('[CLS]')[1]
-        self.eos_id = tokenizer.encode('[SEP]')[1]
+        self.pad_id = tokenizer.pad_token_id
+        self.sep_id = tokenizer.pad_token_id
+        self.bos_id = tokenizer.bos_token_id
+        self.eos_id = tokenizer.eos_token_id
+        self.mask_id = tokenizer.mask_token_id
+
         self.emotion2id = {'开心':0,'悲伤':1,'惊讶':2,'生气':3,'others':4}
 
-        self.input_ids, self.attention_mask, self.labels, self.labels_cls = self.process(file)
+        self.token2id = {
+            "bot": tokenizer['unused1'],
+            "eot":tokenizer['unused2'],
+            "开心":tokenizer['unused3'],
+            "悲伤":tokenizer['unused4'],
+            "惊讶":tokenizer['unused5'],
+            "生气":tokenizer['unused6'],
+            "others":tokenizer['unused7'],
+            "noLabel":tokenizer['unused8'],
+        }
+
+        if mode == 'turn':
+            self.input_ids, self.attention_mask, self.labels, self.labels_cls = self.process_with_turn(file)
+        else:
+            self.input_ids, self.attention_mask, self.labels, self.labels_cls = self.process_with_length(file)
         assert len(self.input_ids) == len(self.attention_mask)
 
-    def process(self, file):
+    def process_with_turn(self, file):
+        input_ids = []
+        attention_mask = []
+        labels  = []
+        labels_cls = None
+        if self.cls_emo:
+            labels_cls = []
+        for item in tqdm(file['data']):
+            for position, dialog in enumerate(item['content']):
+                if position == 0:
+                    continue
+                assert len(dialog)< self.seq_length
+                with tokenizer.as_target_tokenizer():
+                    token_ids_target = self.tokenizer.encode(dialog)
+                labels.append(token_ids_target[1:])
+                if self.cls_emo:
+                    if position-1 >= 0 and item['emotion'][position-1] != 0:
+                        labels_cls.append([self.emotion2id[item['emotion'][position-1]]])
+                    else:
+                        labels_cls.append([-1])
+                _position = position
+                cur_turn = 0
+                token_ids_input = []
+                while _position > 0 and cur_turn < self.turn_num: 
+                    emotion = item['emotion'][_position]
+                    if emotion not in self.token2id.keys():
+                        emotion = 'noLabel'
+                    token_ids_input = [self.token2id('bot')] + self.tokenizer.encode(item['content'][_position-1])[1:-1] + [self.token2id[emotion], self.token2id['eot']] + token_ids_input
+                    _position -= 1
+                input_ids.append([self.bos_id] + token_ids_input + [self.eos_id])
+                attention_mask.append([1 for _ in range(len(token_ids_input)+1)])
+                assert len(input_ids[-1]) == len(attention_mask[-1])
+        return input_ids, attention_mask, labels, labels_cls
+
+    def process_with_length(self, file):
         '''
         data:{
             'data':[

@@ -26,22 +26,84 @@ from modeling_bart import BartForConditionalGeneration,BartForMultiTaskFinetune
 
 
 class GenDataset(torch.utils.data.Dataset):
-    def __init__(self, args, file, tokenizer: BertTokenizer, cls_emo, cls_mode):
+    def __init__(self, args, file, tokenizer: BertTokenizer, cls_emo, cls_mode, add_enc=True, mode='turn', turn_num=6):
+        if add_enc and cls_emo:
+             raise ValueError("Can't add emotion labels to encoder and predict it in the same time")
         self.tokenizer = tokenizer
-        self.seq_length = args.max_source_length
+        if mode == 'length':
+            self.seq_length = args.max_source_length
+        else:
+            self.turn_num = turn_num
         self.cls_emo = cls_emo
         self.cls_mode = cls_mode
+        self.add_enc = add_enc
 
-        self.pad_id = tokenizer.encode('[PAD]')[1]
-        self.sep_id = tokenizer.encode('[PAD]')[1]
-        self.bos_id = tokenizer.encode('[CLS]')[1]
-        self.eos_id = tokenizer.encode('[SEP]')[1]
+        self.pad_id = self.tokenizer.pad_token_id
+        self.sep_id = self.tokenizer.pad_token_id
+        self.bos_id = self.tokenizer.encode('[CLS]')[1]
+        self.eos_id = self.tokenizer.encode('[SEP]')[1]
+        self.mask_id = self.tokenizer.mask_token_id
+
         self.emotion2id = {'开心':0,'悲伤':1,'惊讶':2,'生气':3,'others':4}
 
-        self.input_ids, self.attention_mask, self.labels, self.labels_cls = self.process(file)
+
+        self.token2id = {
+            "bot": self.tokenizer.encode('[bot]')[1],
+            "eot":self.tokenizer.encode('[eot]')[1],
+            "开心":self.tokenizer.encode('[开心]')[1],
+            "悲伤":self.tokenizer.encode('[悲伤]')[1],
+            "惊讶":self.tokenizer.encode('[惊讶]')[1],
+            "生气":self.tokenizer.encode('[生气]')[1],
+            "others":self.tokenizer.encode('[others]')[1],
+            "noLabel":self.tokenizer.encode('[noLabel]')[1],
+        }
+
+        if mode == 'turn':
+            self.input_ids, self.attention_mask, self.labels, self.labels_cls = self.process_with_turn(file)
+        else:
+            self.input_ids, self.attention_mask, self.labels, self.labels_cls = self.process_with_length(file)
         assert len(self.input_ids) == len(self.attention_mask)
 
-    def process(self, file):
+    def process_with_turn(self, file):
+        input_ids = []
+        attention_mask = []
+        labels  = []
+        labels_cls = None
+        if self.cls_emo:
+            labels_cls = []
+        for item in tqdm(file['data']):
+            for position, dialog in enumerate(item['content']):
+                if position == 0:
+                    continue
+                with self.tokenizer.as_target_tokenizer():
+                    token_ids_target = self.tokenizer.encode(dialog)
+                labels.append(token_ids_target[1:])
+                if self.cls_emo:
+                    if position-1 >= 0 and item['emotion'][position-1] != 0:
+                        labels_cls.append([self.emotion2id[item['emotion'][position-1]]])
+                    else:
+                        labels_cls.append([-1])
+                _position = position
+                cur_turn = 0
+                token_ids_input = []
+                while _position > 0 and cur_turn < self.turn_num:
+                    if self.add_enc:
+                        emotion = item['emotion'][_position]
+                        if emotion == 0:
+                            emotion = 'noLabel'
+                        token_ids_input = [self.token2id['bot']] + self.tokenizer.encode(item['content'][_position-1])[1:-1] + [self.token2id[emotion], self.token2id['eot']] + token_ids_input
+                    else:
+                        token_ids_input = [self.token2id['bot']] + self.tokenizer.encode(item['content'][_position-1])[1:-1] + [self.token2id['eot']] + token_ids_input
+                    _position -= 1
+                    cur_turn += 1
+                # print(token_ids_input)
+                input_ids.append([self.bos_id] + token_ids_input + [self.eos_id])
+                attention_mask.append([1 for _ in input_ids[-1]])
+                # print(len(input_ids), len(attention_mask))
+                assert len(input_ids[-1]) == len(attention_mask[-1])
+        return input_ids, attention_mask, labels, labels_cls
+
+    def process_with_length(self, file):
         '''
         data:{
             'data':[
@@ -64,7 +126,7 @@ class GenDataset(torch.utils.data.Dataset):
                 if position == 0:
                     continue
                 assert len(dialog)< self.seq_length
-                with tokenizer.as_target_tokenizer():
+                with self.tokenizer.as_target_tokenizer():
                     token_ids_target = self.tokenizer.encode(dialog)
                 labels.append(token_ids_target[1:])
                 if self.cls_emo:
@@ -88,6 +150,7 @@ class GenDataset(torch.utils.data.Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, idx):
+        # print(self.input_ids[idx])
         if self.cls_emo:
             return {
                 "input_ids":self.input_ids[idx], 
@@ -112,6 +175,7 @@ parser.add_argument("--epoch",default='50',type=str)
 parser.add_argument("--data_dir",default="/path/to/dataset/",type=str)
 parser.add_argument("--local_rank", default=-1, type=int)
 parser.add_argument("--cls_emo", default=False, type=bool)
+parser.add_argument("--add_enc", default=False, type=bool)
 parser.add_argument("--cls_mode", default=1, type=int)
 parser.add_argument("--gen_csk", default=False, type=bool)
 parser.add_argument("--alpha", default=1.0, type=float)
@@ -159,9 +223,10 @@ args=[
     '--learning_rate',str(arg_dict['lr']),
     '--load_best_model_at_end',str(True), 
     '--metric_for_best_model',"eval_rouge-l", 
-    '--greater_is_better',str(False),
-    '--save_total_limit', str(2),
+    '--greater_is_better',str(True),
+    '--save_total_limit', str(1),
     '--cls_emo', str(args.cls_emo),
+    '--add_enc', str(args.add_enc),
     '--cls_mode', str(args.cls_mode),
     '--gen_csk', str(args.gen_csk),
     '--beta',str(args.beta),
@@ -218,6 +283,7 @@ def add_emotion_token(tokenizer, model):
     model.resize_token_embedding(len(tokenizer))
 
 tokenizer=BertTokenizer.from_pretrained(model_args.model_name_or_path)
+tokenizer.add_special_tokens({'additional_special_tokens':["[bot]","[eot]","[开心]","[悲伤]","[惊讶]","[生气]","[others]","[noLael]"]})
 model = BartForMultiTaskFinetune.from_pretrained(model_args.model_name_or_path, 
                                                 tokenizer = tokenizer, 
                                                 cls_emo = model_args.cls_emo, 
@@ -234,15 +300,14 @@ model.config.max_length=data_args.val_max_target_length
 
 
 if training_args.do_train:
-    train_dataset = GenDataset(args = data_args, file=datasets['train'], tokenizer=tokenizer, cls_emo=model_args.cls_emo, cls_mode=model_args.cls_mode)
+    # print(model_args.cls_emo)
+    train_dataset = GenDataset(args = data_args, file=datasets['train'], tokenizer=tokenizer, cls_emo=model_args.cls_emo, cls_mode=model_args.cls_mode, add_enc=model_args.add_enc)
 
 if training_args.do_eval:
-    eval_dataset = GenDataset(args = data_args, file=datasets['validation'],tokenizer=tokenizer, cls_emo=model_args.cls_emo, cls_mode=model_args.cls_mode)
+    eval_dataset = GenDataset(args = data_args, file=datasets['validation'],tokenizer=tokenizer, cls_emo=model_args.cls_emo, cls_mode=model_args.cls_mode, add_enc=model_args.add_enc)
 
 if training_args.do_predict:
-    test_dataset = GenDataset(args = data_args, file=datasets['test'],tokenizer=tokenizer, cls_emo=model_args.cls_emo, cls_mode=model_args.cls_mode)
-
-
+    test_dataset = GenDataset(args = data_args, file=datasets['test'],tokenizer=tokenizer, cls_emo=model_args.cls_emo, cls_mode=model_args.cls_mode, add_enc=model_args.add_enc)
 
 max_eval_num=30000
 if len(eval_dataset)>max_eval_num:
@@ -298,11 +363,11 @@ def compute_metrics(eval_preds):
     result = {k: round(v, 4) for k, v in result.items()}
     return result
 
-class TestCallback(TrainerCallback):
-    def on_evaluate(self, args, state, control, **kwargs):
-        predictions, labels, metrics = trainer.predict(test_dataset, metric_key_prefix="predict")
-        metrics['epoch']=state.epoch
-        state.log_history.append(metrics)
+# class TestCallback(TrainerCallback):
+#     def on_evaluate(self, args, state, control, **kwargs):
+#         predictions, labels, metrics = trainer.predict(test_dataset, metric_key_prefix="predict")
+#         metrics['epoch']=state.epoch
+#         state.log_history.append(metrics)
 
 # Initialize our Trainer
 trainer = Seq2SeqTrainer(
@@ -313,7 +378,7 @@ trainer = Seq2SeqTrainer(
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics if training_args.predict_with_generate else None,
-    callbacks=[TestCallback],
+    callbacks=[EarlyStoppingCallback(10,0.0)],
 )
 
 

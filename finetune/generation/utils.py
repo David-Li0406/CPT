@@ -26,6 +26,9 @@ class ModelArguments:
     cls_emo: Optional[bool] = field(
         default=False, metadata={"help": ""}
     )
+    add_enc: Optional[bool] = field(
+        default=False, metadata={"help": ""}
+    )
     cls_mode: Optional[str] = field(
         default=1, metadata={"help": ""}
     )

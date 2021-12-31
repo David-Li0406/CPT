@@ -2316,21 +2316,31 @@ class MyBartModel(BartPretrainedModel):
                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
             )
         
+
+
         cls_logits = None
         if self.classification_head:
+            id2labels = {
+                -1: '[noLabel]',
+                0:'[开心]',
+                1:'[悲伤]',
+                2:'[惊讶]',
+                3:'[生气]',
+                4:'[others]',
+            }
             if labels_cls == None:
                 if len(torch.unique(decoder_input_ids.sum(1))) == 1 and decoder_input_ids[0,0] == 102:
                     enc_hidden_states = encoder_outputs.last_hidden_state if return_dict else encoder_outputs[0]
                     enc_rep = enc_hidden_states[:, 0]
                     cls_logits = self.classification_head(enc_rep)
                     items = torch.argmax(cls_logits,dim=1)
-                    emotion_label = torch.tensor(self.tokenizer.encode(["[unused{}]".format(item+1) for item in items])[1:-1]).to(decoder_input_ids.device)
+                    emotion_label = torch.tensor(self.tokenizer.encode([id2labels[int(item)] for item in items])[1:-1]).to(decoder_input_ids.device)
                     decoder_input_ids = torch.cat([decoder_input_ids[:,0].unsqueeze(dim=-1), emotion_label.unsqueeze(dim=-1), decoder_input_ids[:,1:]],dim=-1)
             else:
                 enc_hidden_states = encoder_outputs.last_hidden_state if return_dict else encoder_outputs[0]
                 enc_rep = enc_hidden_states[:, 0]
                 cls_logits = self.classification_head(enc_rep)
-                emotion_label = torch.tensor(self.tokenizer.encode(["[unused{}]".format(item+1 if item != -1 else 6) for item in labels_cls.squeeze()])[1:-1]).to(decoder_input_ids.device)
+                emotion_label = torch.tensor(self.tokenizer.encode([id2labels[int(item)] for item in labels_cls.squeeze()])[1:-1]).to(decoder_input_ids.device)
                 decoder_input_ids = torch.cat([decoder_input_ids[:,0].unsqueeze(dim=-1), emotion_label.unsqueeze(dim=-1), decoder_input_ids[:,1:]],dim=-1)
                 labels = torch.cat([labels[:,0].unsqueeze(dim=-1), torch.zeros(labels.size(0),1).fill_(-100).to(decoder_input_ids.device), labels[:,1:]],dim=-1).long()
 
@@ -2430,6 +2440,8 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
                 self.model = MyBartModel(config, gen_csk=gen_csk, tokenizer=tokenizer)
             self.model._init_weights(self.classification_head.dense)
             self.model._init_weights(self.classification_head.out_proj)
+        else:
+            self.model = MyBartModel(config, gen_csk=gen_csk, tokenizer=tokenizer)
         
         self.gen_csk = gen_csk
         if self.gen_csk:
@@ -2563,8 +2575,6 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
                 elif self.cls_mode == 3:
                     rep = torch.cat([enc_rep, dec_rep], dim=-1)
                     cls_logits = self.classification_head(rep)
-                else:
-                    raise NotImplementedError
 
             loss_cls = None
             if labels_cls is not None:
