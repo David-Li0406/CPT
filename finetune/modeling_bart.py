@@ -15,6 +15,7 @@
 """ PyTorch BART model. """
 import copy
 from json import decoder
+from logging import raiseExceptions
 import math
 import random
 import warnings
@@ -272,8 +273,9 @@ class BartAttention(nn.Module):
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
-        key_states = key_states.view(*proj_shape)
-        value_states = value_states.view(*proj_shape)
+        # print(key_states.shape,proj_shape)
+        key_states = key_states.contiguous().view(*proj_shape)
+        value_states = value_states.contiguous().view(*proj_shape)
 
         src_len = key_states.size(1)
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
@@ -457,7 +459,7 @@ class BartDecoderLayer(nn.Module):
                 returned tensors for more detail.
         """
         residual = hidden_states
-
+        print(encoder_attention_mask.shape,len(past_key_value))
         # Self Attention
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
@@ -1975,13 +1977,15 @@ class MyBartDecoder(BartPretrainedModel):
             combined_attention_mask = _make_causal_mask(
                 input_shape, inputs_embeds.dtype, past_key_values_length=past_key_values_length
             ).to(self.device)
-
+        
+        # print(combined_attention_mask.shape)
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
             combined_attention_mask = (
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
+        # print(combined_attention_mask.shape)
 
         return combined_attention_mask
 
@@ -2102,7 +2106,7 @@ class MyBartDecoder(BartPretrainedModel):
         if encoder_hidden_states is not None and encoder_attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
-
+        
         # embed positions
         positions = self.embed_positions(input_shape, past_key_values_length)
 
@@ -2226,7 +2230,7 @@ class MyBartDecoder(BartPretrainedModel):
     BART_START_DOCSTRING,
 )
 class MyBartModel(BartPretrainedModel):
-    def __init__(self, config: BartConfig, classification_head = None, gen_csk=None, tokenizer=None):
+    def __init__(self, config: BartConfig, classification_head = None, gen_csk=None, tokenizer=None, prefix_encoder=None):
         super().__init__(config)
 
         self.gen_csk = gen_csk
@@ -2234,12 +2238,24 @@ class MyBartModel(BartPretrainedModel):
         padding_idx, vocab_size = config.pad_token_id, config.vocab_size
         self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
         self.classification_head = classification_head
+        self.prefix_encoder = prefix_encoder
+        self.dropout = torch.nn.Dropout(config.dropout)
+        if self.classification_head and self.self.prefix_encoder:
+            raise "Classification using prompt does not need cls head!"
 
         self.encoder = BartEncoder(config, self.shared)
         self.decoder = MyBartDecoder(config, self.shared, gen_csk)
 
         # Initialize weights and apply final processing
         self.init_weights()
+
+        if self.prefix_encoder:
+            self.pre_seq_len = config.pre_seq_len
+            self.n_layer = config.decoder_layers
+            self.n_head = config.decoder_attention_heads
+            self.n_embd = config.d_model // config.decoder_attention_heads
+
+            self.prefix_tokens = torch.arange(self.pre_seq_len).long()
 
     def get_input_embeddings(self):
         return self.shared
@@ -2283,7 +2299,7 @@ class MyBartModel(BartPretrainedModel):
         labels_cls = None,
         labels=None
     ):
-
+    
         # different to other models, Bart automatically creates decoder_input_ids from
         # input_ids if no decoder_input_ids are provided
         if decoder_input_ids is None and decoder_inputs_embeds is None:
@@ -2328,21 +2344,42 @@ class MyBartModel(BartPretrainedModel):
                 3:'[生气]',
                 4:'[others]',
             }
+            enc_hidden_states = encoder_outputs.last_hidden_state if return_dict else encoder_outputs[0]
             if labels_cls == None:
                 if len(torch.unique(decoder_input_ids.sum(1))) == 1 and decoder_input_ids[0,0] == 102:
-                    enc_hidden_states = encoder_outputs.last_hidden_state if return_dict else encoder_outputs[0]
                     enc_rep = enc_hidden_states[:, 0]
                     cls_logits = self.classification_head(enc_rep)
                     items = torch.argmax(cls_logits,dim=1)
                     emotion_label = torch.tensor(self.tokenizer.encode([id2labels[int(item)] for item in items])[1:-1]).to(decoder_input_ids.device)
                     decoder_input_ids = torch.cat([decoder_input_ids[:,0].unsqueeze(dim=-1), emotion_label.unsqueeze(dim=-1), decoder_input_ids[:,1:]],dim=-1)
             else:
-                enc_hidden_states = encoder_outputs.last_hidden_state if return_dict else encoder_outputs[0]
                 enc_rep = enc_hidden_states[:, 0]
                 cls_logits = self.classification_head(enc_rep)
                 emotion_label = torch.tensor(self.tokenizer.encode([id2labels[int(item)] for item in labels_cls.squeeze()])[1:-1]).to(decoder_input_ids.device)
                 decoder_input_ids = torch.cat([decoder_input_ids[:,0].unsqueeze(dim=-1), emotion_label.unsqueeze(dim=-1), decoder_input_ids[:,1:]],dim=-1)
                 labels = torch.cat([labels[:,0].unsqueeze(dim=-1), torch.zeros(labels.size(0),1).fill_(-100).to(decoder_input_ids.device), labels[:,1:]],dim=-1).long()
+
+        if self.prefix_encoder:
+            enc_hidden_states = encoder_outputs.last_hidden_state if return_dict else encoder_outputs[0]
+            def get_mask():
+                mask = torch.zeros_like(input_ids)
+                # 找到mask所对应的idx
+                choosen_idx = (mask == 103).nonzero()
+                mask[choosen_idx] = True
+                if len(torch.unique(mask.sum(1))) > 1:
+                    raise ValueError("All examples must have the same number of <mask> tokens.")
+                rep = enc_hidden_states[mask, :].view(enc_hidden_states.size(0), -1, enc_hidden_states.size(-1))[
+                    :, -1, :
+                ]
+                return rep
+            if (labels != None) or (labels == None and (len(torch.unique(decoder_input_ids.sum(1))) == 1 and decoder_input_ids[0,0] == 102)):
+                batch_size = input_ids.shape[0]
+                mask_rep = get_mask()
+                past_key_values = self.get_prompt(batch_size=batch_size,mask_rep=mask_rep)
+                # prefix_attention_mask = torch.ones(batch_size, self.pre_seq_len).to(self.device)
+                # print(decoder_attention_mask)
+                # decoder_attention_mask = torch.cat((prefix_attention_mask, decoder_attention_mask), dim=1)
+
 
 
         # for dialogue generation
@@ -2401,6 +2438,35 @@ class MyBartModel(BartPretrainedModel):
             labels=labels,
         )
 
+    def get_prompt(self, batch_size, mask_rep):
+        prefix_tokens = self.prefix_tokens.unsqueeze(0).expand(batch_size, -1).to(self.device)
+        past_key_values_self_attn, past_key_values_encoder = self.prefix_encoder(prefix=prefix_tokens, mask_rep=mask_rep)
+        # bsz, seqlen, _ = past_key_values.shape
+        def trans(past_key_values):
+            past_key_values = past_key_values.view(
+                batch_size,
+                self.pre_seq_len,
+                self.n_layer * 2, 
+                self.n_head,
+                self.n_embd
+            )
+            print(past_key_values.shape)
+            past_key_values = self.dropout(past_key_values)
+            past_key_values = past_key_values.permute([2, 0, 3, 1, 4])
+            print(past_key_values.shape)
+            # past_key_values = past_key_values.split(6)
+            past_key_values = past_key_values.view(self.n_layer,2,past_key_values.size(1),past_key_values.size(2),past_key_values.size(3),past_key_values.size(4))
+            return past_key_values
+        past_key_values_self_attn = trans(past_key_values_self_attn)
+        past_key_values_encoder = trans(past_key_values_encoder)
+
+        past_key_values = ((past_key_values1[0],past_key_values1[1],past_key_values2[0],past_key_values2[1]) for past_key_values1, past_key_values2 in zip(past_key_values_self_attn,past_key_values_encoder))
+        past_key_values = tuple(tuple(k) for k in past_key_values)
+        print(past_key_values[0][0].shape)
+        print(len(past_key_values))
+        print(len(past_key_values[0]))
+        return past_key_values
+
 @add_start_docstrings(
     "The BART Model with a language modeling head. Can be used for summarization.", BART_START_DOCSTRING
 )
@@ -2426,20 +2492,29 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
             elif self.cls_mode == 3:
                 logger.info('Both encoder & decoder for classification.')
                 cls_dim = config.d_model * 2
+            elif self.cls_mode ==4:
+                logger.info('Prompt for classification')
+                cls_dim = None
             else:
                 raise NotImplementedError
-            self.classification_head = BartClassificationHead(
-                cls_dim,
-                cls_dim,
-                config.num_class,
-                config.classifier_dropout,
-            )
+            if self.cls_mode != 4:
+                self.classification_head = BartClassificationHead(
+                    cls_dim,
+                    cls_dim,
+                    config.num_class,
+                    config.classifier_dropout,
+                )
+            else:
+                self.prefix_encoder = PrefixEncoder(config)
             if self.cls_mode == 1:
                 self.model = MyBartModel(config, classification_head = self.classification_head, gen_csk=gen_csk, tokenizer=tokenizer)
+            elif self.cls_mode == 4:
+                self.model = MyBartModel(config, gen_csk=gen_csk, tokenizer=tokenizer, prefix_encoder=self.prefix_encoder)
             else:
                 self.model = MyBartModel(config, gen_csk=gen_csk, tokenizer=tokenizer)
-            self.model._init_weights(self.classification_head.dense)
-            self.model._init_weights(self.classification_head.out_proj)
+            if self.cls_mode != 4:
+                self.model._init_weights(self.classification_head.dense)
+                self.model._init_weights(self.classification_head.out_proj)
         else:
             self.model = MyBartModel(config, gen_csk=gen_csk, tokenizer=tokenizer)
         
@@ -2514,6 +2589,7 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
 
         Returns:
         """
+        print('encoder_attention_mask',attention_mask.shape)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         if labels is not None:
             if decoder_input_ids is None and decoder_inputs_embeds is None:
@@ -2562,6 +2638,7 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
                 enc_rep = enc_hidden_states[:, 0]
 
                 eos_mask = torch.zeros_like(decoder_input_ids)
+                # 找到eos token的位置，也就是去掉padding后decoder_input_ids的长度
                 choosen_idx = [ids.masked_select(ids>0).size(0)-1 for ids in decoder_input_ids]
                 eos_mask[:, choosen_idx] = True
                 if len(torch.unique(eos_mask.sum(1))) > 1:
@@ -2649,3 +2726,30 @@ class BartForMultiTaskFinetune(BartPretrainedModel):
                 tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
             )
         return reordered_past
+
+
+class PrefixEncoder(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.embedding = torch.nn.Embedding(config.pre_seq_len, config.d_model)
+        self.lstm = nn.LSTM(input_size=2*config.d_model,
+                            hidden_size=2*config.d_model,
+                            num_layers=config.decoder_layers,
+                            batch_first=True,
+                            bidirectional=False)
+        self.projection1 = nn.Linear(2*config.d_model, 2*config.d_model*config.decoder_layers)
+        self.projection2 = nn.Linear(2*config.d_model, 2*config.d_model*config.decoder_layers)
+
+    def forward(self, prefix, mask_rep):
+        prefix_emb = self.embedding(prefix)
+        mask_rep = mask_rep.unsqueeze(dim=1).repeat(1,self.config.pre_seq_len,1)
+        # print(mask_rep.shape,prefix_emb.shape)
+        prefix_mask_emb = torch.cat([prefix_emb, mask_rep], dim=-1)
+        # print(prefix_mask_emb.shape)
+        output, (_, _) = self.lstm(prefix_mask_emb)
+        # print(output.shape)
+        output1 = self.projection2(output)
+        output2 = self.projection2(output)
+        # print(output.shape)
+        return (output1,output2)

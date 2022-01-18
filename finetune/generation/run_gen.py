@@ -26,7 +26,7 @@ from modeling_bart import BartForConditionalGeneration,BartForMultiTaskFinetune
 
 
 class GenDataset(torch.utils.data.Dataset):
-    def __init__(self, args, file, tokenizer: BertTokenizer, cls_emo, cls_mode, add_enc=True, mode='turn', turn_num=6):
+    def __init__(self, args, file, tokenizer: BertTokenizer, cls_emo, cls_mode, add_enc=True, mode='turn', turn_num=6, prompt=True):
         if add_enc and cls_emo:
              raise ValueError("Can't add emotion labels to encoder and predict it in the same time")
         self.tokenizer = tokenizer
@@ -37,6 +37,7 @@ class GenDataset(torch.utils.data.Dataset):
         self.cls_emo = cls_emo
         self.cls_mode = cls_mode
         self.add_enc = add_enc
+        self.prompt = prompt
 
         self.pad_id = self.tokenizer.pad_token_id
         self.sep_id = self.tokenizer.pad_token_id
@@ -71,7 +72,7 @@ class GenDataset(torch.utils.data.Dataset):
         labels_cls = None
         if self.cls_emo:
             labels_cls = []
-        for item in tqdm(file['data']):
+        for item in tqdm(file['data'][:2]):
             for position, dialog in enumerate(item['content']):
                 if position == 0:
                     continue
@@ -97,8 +98,11 @@ class GenDataset(torch.utils.data.Dataset):
                     _position -= 1
                     cur_turn += 1
                 # print(token_ids_input)
-                input_ids.append([self.bos_id] + token_ids_input + [self.eos_id])
-                attention_mask.append([1 for _ in input_ids[-1]])
+                input_id = [self.bos_id] + token_ids_input + [self.eos_id]
+                if self.prompt:
+                    input_id = self.add_template(input_id)
+                input_ids.append(input_id)
+                attention_mask.append([1 for _ in input_id])
                 # print(len(input_ids), len(attention_mask))
                 assert len(input_ids[-1]) == len(attention_mask[-1])
         return input_ids, attention_mask, labels, labels_cls
@@ -145,6 +149,12 @@ class GenDataset(torch.utils.data.Dataset):
                 attention_mask.append([1 for _ in range(len(token_ids_input)+1)]+[0 for _ in range(self.seq_length - len(token_ids_input))])
                 assert len(input_ids[-1]) == len(attention_mask[-1])
         return input_ids, attention_mask, labels, labels_cls
+
+    def add_template(self, input_id, method="discrete", template="对话人感到[MASK]"):
+        template_id = self.tokenizer.encode(template)[1:-1]
+        input_id = input_id[:-1] + template_id + [input_id[-1]]
+        return input_id
+
 
     def __len__(self):
         return len(self.input_ids)
